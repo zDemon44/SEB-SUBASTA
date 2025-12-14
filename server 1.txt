@@ -1,0 +1,15 @@
+javac -d . servidor/*.java cliente/*.java
+
+server 1
+java -cp bin servidor.ServidorSubasta 5000
+
+server 2
+java -cp bin servidor.ServidorSubasta 5001
+
+Clientes
+java -cp bin cliente.ClienteSubasta
+
+
+
+verificar ubicacion
+dir
