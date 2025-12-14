@@ -5,16 +5,14 @@ import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * Servidor de Subasta en Tiempo Real
- * Acepta múltiples participantes, gestiona ofertas y determina ganador
- * Diseñado para sesiones continuas con reinicio automático
+ * Servidor de Subasta con Tolerancia a Fallos
+ * Implementa algoritmo de anillo para elección de líder
  */
 public class ServidorSubasta {
-    // Estados posibles de la subasta
     private enum Estado {
-        PREPARACION,    // Esperando participantes
-        EN_CURSO,       // Subasta activa
-        COMPLETADA      // Subasta terminada
+        PREPARACION,
+        EN_CURSO,
+        COMPLETADA
     }
 
     private static final int DURACION_SUBASTA = 90000; // 90 segundos
@@ -23,25 +21,47 @@ public class ServidorSubasta {
     private static long momentoInicio;
     private static Timer temporizadorPrincipal;
     private static Timer temporizadorActualizaciones;
-
-    // Oferta máxima (thread-safe)
-    private static volatile double ofertaMaxima = 0.0;
-    private static volatile String ipOfertaMaxima = "ninguno";
-    private static final Object bloqueo = new Object();
     private static int contadorSesiones = 0;
 
-    public static void main(String[] args) {
-        int puerto = 9090; // Puerto modificado
+    // *** NUEVAS VARIABLES PARA RING ***
+    private static CoordinadorRing coordinadorRing;
+    private static EstadoSubasta estadoCompartido;
+    private static int miIdServidor;
 
-        if (args.length == 1)
-            puerto = Integer.parseInt(args[0]);
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            System.out.println("Uso: java servidor.ServidorSubasta <ID_SERVIDOR>");
+            System.out.println("IDs válidos: 1, 2, 3");
+            return;
+        }
+
+        miIdServidor = Integer.parseInt(args[0]);
+
+        if (!ConfiguracionRing.esIdValido(miIdServidor)) {
+            System.out.println("❌ ID de servidor inválido: " + miIdServidor);
+            return;
+        }
+
+        ConfiguracionRing.InfoServidor miInfo = 
+            ConfiguracionRing.obtenerServidor(miIdServidor);
 
         try {
-            ServerSocket socketServidor = new ServerSocket(puerto);
-            System.out.println("╔════════════════════════════════════════════╗");
+            // Inicializar estado compartido
+            estadoCompartido = new EstadoSubasta();
+
+            // Iniciar coordinador de anillo
+            coordinadorRing = new CoordinadorRing(miIdServidor, estadoCompartido);
+            coordinadorRing.iniciar();
+
+            // Iniciar servidor de clientes
+            ServerSocket socketServidor = new ServerSocket(miInfo.puertoClientes);
+            
+            System.out.println("\n╔════════════════════════════════════════════╗");
             System.out.println("║  SERVIDOR DE SUBASTA ACTIVO                ║");
-            System.out.println("║  Puerto: " + puerto + "                              ║");
-            System.out.println("╔════════════════════════════════════════════╗");
+            System.out.println("║  ID: " + miIdServidor + "                                      ║");
+            System.out.println("║  Puerto Clientes: " + miInfo.puertoClientes + "                    ║");
+            System.out.println("║  Puerto Ring: " + miInfo.puerto + "                        ║");
+            System.out.println("╚════════════════════════════════════════════╝");
 
             // Ciclo infinito para múltiples sesiones
             while (true) {
@@ -74,8 +94,10 @@ public class ServidorSubasta {
                     String ip = socketParticipante.getInetAddress().getHostAddress();
                     System.out.println("[CONEXIÓN] Participante desde: " + ip);
 
-                    // Si es el primer participante, iniciar subasta
-                    if (estadoActual == Estado.PREPARACION && participantes.isEmpty()) {
+                    // *** SOLO EL LÍDER INICIA LA SUBASTA ***
+                    if (estadoActual == Estado.PREPARACION && 
+                        participantes.isEmpty() && 
+                        coordinadorRing.soyLider()) {
                         iniciarSubasta();
                     }
 
@@ -115,10 +137,7 @@ public class ServidorSubasta {
                 }
             }
 
-            // Esperar procesamiento final
             Thread.sleep(2000);
-
-            // Reiniciar todo
             reiniciarEstado();
 
         } catch (Exception ex) {
@@ -127,18 +146,23 @@ public class ServidorSubasta {
     }
 
     /**
-     * Inicia una nueva subasta
+     * Inicia una nueva subasta (solo líder)
      */
     private static void iniciarSubasta() {
+        if (!coordinadorRing.soyLider()) {
+            System.out.println("[AVISO] No soy líder, no puedo iniciar subasta");
+            return;
+        }
+
         estadoActual = Estado.EN_CURSO;
         momentoInicio = System.currentTimeMillis();
+        estadoCompartido.iniciar();
 
         System.out.println("\n╔════════════════════════════════════════════╗");
-        System.out.println("║  SUBASTA #" + contadorSesiones + " INICIADA              ║");
+        System.out.println("║  SUBASTA #" + contadorSesiones + " INICIADA [LÍDER]       ║");
         System.out.println("║  Duración: " + (DURACION_SUBASTA/1000) + " segundos                   ║");
         System.out.println("╚════════════════════════════════════════════╝");
 
-        // Cancelar timers previos
         if (temporizadorPrincipal != null) {
             temporizadorPrincipal.cancel();
         }
@@ -146,7 +170,6 @@ public class ServidorSubasta {
             temporizadorActualizaciones.cancel();
         }
 
-        // Timer de finalización
         temporizadorPrincipal = new Timer();
         temporizadorPrincipal.schedule(new TimerTask() {
             @Override
@@ -155,12 +178,11 @@ public class ServidorSubasta {
             }
         }, DURACION_SUBASTA);
 
-        // Timer de actualizaciones cada 4 segundos
         configurarActualizacionesPeriodicas();
     }
 
     /**
-     * Configura envío periódico de la oferta líder cada 4 segundos
+     * Configura actualizaciones periódicas
      */
     private static void configurarActualizacionesPeriodicas() {
         temporizadorActualizaciones = new Timer();
@@ -173,21 +195,23 @@ public class ServidorSubasta {
                 }
                 transmitirActualizacion();
             }
-        }, 4000, 4000); // Cada 4 segundos
+        }, 4000, 4000);
 
         System.out.println("[SYNC] Actualizaciones cada 4 segundos activadas");
     }
 
     /**
-     * Transmite la oferta líder actual a todos los participantes
+     * Transmite actualización a todos los participantes
      */
     private static void transmitirActualizacion() {
         if (participantes.isEmpty()) {
             return;
         }
 
-        String actualizacion = obtenerOfertaMaxima() + ":TIEMPO:" + segundosRestantes();
-        System.out.println("[SYNC] Oferta máxima: $" + ofertaMaxima +
+        String actualizacion = estadoCompartido.obtenerOfertaMaxima() + 
+                              ":TIEMPO:" + segundosRestantes();
+        
+        System.out.println("[SYNC] Oferta máxima: $" + estadoCompartido.getOfertaMaxima() +
                          " (" + participantes.size() + " participantes)");
 
         for (ManejadorCliente participante : participantes) {
@@ -200,10 +224,11 @@ public class ServidorSubasta {
     }
 
     /**
-     * Termina la subasta y notifica el resultado
+     * Termina la subasta
      */
     private static void terminarSubasta() {
         estadoActual = Estado.COMPLETADA;
+        estadoCompartido.finalizar();
 
         System.out.println("\n╔════════════════════════════════════════════╗");
         System.out.println("║  SUBASTA #" + contadorSesiones + " FINALIZADA            ║");
@@ -214,33 +239,23 @@ public class ServidorSubasta {
             return;
         }
 
-        // Determinar ganador
-        ManejadorCliente ganador = null;
-        double ofertaGanadora = -1;
-
+        // Usar estado compartido para determinar ganador
+        EstadoSubasta.InfoParticipante ganador = estadoCompartido.obtenerGanador();
+        
         System.out.println("\n=== OFERTAS RECIBIDAS ===");
-        for (ManejadorCliente participante : participantes) {
-            double oferta = participante.getOfertaActual();
-            String ip = participante.getDireccionIP();
-            System.out.println("  → " + ip + ": $" + oferta);
-
-            if (oferta > ofertaGanadora) {
-                ofertaGanadora = oferta;
-                ganador = participante;
-            }
+        for (EstadoSubasta.InfoParticipante p : estadoCompartido.obtenerParticipantes()) {
+            System.out.println("  → " + p.ip + ": $" + p.ultimaOferta);
         }
 
-        if (ganador != null) {
-            System.out.println("\n★ GANADOR: " + ganador.getDireccionIP() +
-                             " - Oferta: $" + ofertaGanadora + " ★");
+        if (ganador != null && ganador.ultimaOferta > 0) {
+            System.out.println("\n★ GANADOR: " + ganador.ip +
+                             " - Oferta: $" + ganador.ultimaOferta + " ★");
 
-            // Notificar a todos
-            String mensaje = "RESULTADO:" + ganador.getDireccionIP() +
-                           ":OFERTA:" + ofertaGanadora;
+            String mensaje = "RESULTADO:" + ganador.ip +
+                           ":OFERTA:" + ganador.ultimaOferta;
             notificarTodos(mensaje);
         }
 
-        // Cerrar conexiones
         for (ManejadorCliente participante : participantes) {
             participante.desconectar();
         }
@@ -249,7 +264,7 @@ public class ServidorSubasta {
     }
 
     /**
-     * Notifica un mensaje a todos los participantes
+     * Notifica mensaje a todos los participantes
      */
     private static void notificarTodos(String mensaje) {
         for (ManejadorCliente participante : participantes) {
@@ -262,12 +277,11 @@ public class ServidorSubasta {
     }
 
     /**
-     * Reinicia el estado para una nueva sesión
+     * Reinicia el estado
      */
     private static void reiniciarEstado() {
         System.out.println("\n[REINICIO] Preparando nueva sesión...");
 
-        // Cancelar timers
         if (temporizadorPrincipal != null) {
             temporizadorPrincipal.cancel();
             temporizadorPrincipal = null;
@@ -277,44 +291,36 @@ public class ServidorSubasta {
             temporizadorActualizaciones = null;
         }
 
-        // Limpiar datos
         participantes.clear();
-
-        synchronized(bloqueo) {
-            ofertaMaxima = 0.0;
-            ipOfertaMaxima = "ninguno";
-        }
-
+        estadoCompartido.reiniciar();
         estadoActual = Estado.PREPARACION;
 
         System.out.println("[LISTO] Sistema preparado para nueva sesión\n");
     }
 
     /**
-     * Registra una nueva oferta y actualiza el máximo si corresponde
+     * Registra una nueva oferta (con sincronización Ring)
      */
     public static boolean registrarOferta(double nuevaOferta, String ip) {
-        synchronized(bloqueo) {
-            if (nuevaOferta > ofertaMaxima) {
-                ofertaMaxima = nuevaOferta;
-                ipOfertaMaxima = ip;
-                System.out.println("[NUEVO MÁXIMO] $" + nuevaOferta + " de " + ip);
-                return true;
+        boolean esMaxima = estadoCompartido.registrarOferta(nuevaOferta, ip);
+        
+        if (esMaxima) {
+            System.out.println("[NUEVO MÁXIMO] $" + nuevaOferta + " de " + ip);
+            
+            // *** SINCRONIZAR CON OTROS SERVIDORES ***
+            if (coordinadorRing.soyLider()) {
+                coordinadorRing.sincronizarEstado(nuevaOferta, ip);
             }
-            return false;
         }
+        
+        return esMaxima;
     }
 
     /**
      * Obtiene información de la oferta máxima
      */
     public static String obtenerOfertaMaxima() {
-        synchronized(bloqueo) {
-            if (ofertaMaxima == 0.0) {
-                return "OFERTA_MAX:ninguno:0.0";
-            }
-            return "OFERTA_MAX:" + ipOfertaMaxima + ":" + ofertaMaxima;
-        }
+        return estadoCompartido.obtenerOfertaMaxima();
     }
 
     /**
@@ -325,7 +331,7 @@ public class ServidorSubasta {
     }
 
     /**
-     * Calcula segundos restantes de la subasta
+     * Calcula segundos restantes
      */
     public static long segundosRestantes() {
         if (estadoActual != Estado.EN_CURSO) {
@@ -334,5 +340,14 @@ public class ServidorSubasta {
         long transcurrido = System.currentTimeMillis() - momentoInicio;
         long restante = (DURACION_SUBASTA - transcurrido) / 1000;
         return Math.max(0, restante);
+    }
+
+    // Getters para el Ring
+    public static CoordinadorRing getCoordinador() {
+        return coordinadorRing;
+    }
+
+    public static EstadoSubasta getEstadoCompartido() {
+        return estadoCompartido;
     }
 }

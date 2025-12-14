@@ -3,10 +3,11 @@ package cliente;
 import servidor.SocketWrapper;
 import java.net.*;
 import java.io.*;
+import java.util.*;
 
 /**
- * Helper del Cliente de Subasta - Lógica de comunicación
- * Maneja el protocolo de comunicación con el servidor
+ * Helper del Cliente con capacidad de Failover
+ * Se reconecta automáticamente si el servidor falla
  */
 public class ClienteSubastaHelper {
     private SocketWrapper socket;
@@ -20,6 +21,22 @@ public class ClienteSubastaHelper {
     private volatile String ultimaConfirmacion = null;
     private final Object lockConfirmacion = new Object();
 
+    // *** LISTA DE SERVIDORES PARA FAILOVER ***
+    private List<ServidorInfo> servidoresDisponibles;
+    private int indiceServidorActual = 0;
+    private static final int MAX_REINTENTOS = 3;
+    private static final int TIMEOUT_RECONEXION = 5000; // 5 segundos
+
+    private static class ServidorInfo {
+        String host;
+        int puerto;
+
+        ServidorInfo(String host, int puerto) {
+            this.host = host;
+            this.puerto = puerto;
+        }
+    }
+
     /**
      * Constructor - Establece conexión con el servidor
      */
@@ -29,12 +46,124 @@ public class ClienteSubastaHelper {
         this.servidorHost = InetAddress.getByName(host);
         this.servidorPuerto = Integer.parseInt(puerto);
 
+        // Inicializar lista de servidores disponibles
+        inicializarServidores(host);
+
         // Conectar
-        this.socket = new SocketWrapper(host, this.servidorPuerto);
-        System.out.println("\n✓ Conectado al servidor: " + host + ":" + puerto);
+        conectarConFailover();
 
         // Iniciar hilo receptor
         iniciarReceptor();
+    }
+
+    /**
+     * Inicializa la lista de servidores disponibles
+     */
+    private void inicializarServidores(String hostPrincipal) {
+        servidoresDisponibles = new ArrayList<>();
+        
+        // Agregar servidores configurados
+        servidoresDisponibles.add(new ServidorInfo("localhost", 9090));
+        servidoresDisponibles.add(new ServidorInfo("localhost", 9091));
+        servidoresDisponibles.add(new ServidorInfo("localhost", 9092));
+
+        // Buscar el servidor al que nos conectamos primero
+        for (int i = 0; i < servidoresDisponibles.size(); i++) {
+            if (servidoresDisponibles.get(i).puerto == servidorPuerto) {
+                indiceServidorActual = i;
+                break;
+            }
+        }
+    }
+
+    /**
+     * Intenta conectar con failover automático
+     */
+    private boolean conectarConFailover() {
+        int intentos = 0;
+        int servidorInicio = indiceServidorActual;
+
+        while (intentos < servidoresDisponibles.size()) {
+            ServidorInfo servidor = servidoresDisponibles.get(indiceServidorActual);
+            
+            try {
+                System.out.println("\n[FAILOVER] Intentando conectar a " + 
+                                 servidor.host + ":" + servidor.puerto);
+                
+                this.socket = new SocketWrapper(servidor.host, servidor.puerto);
+                this.servidorHost = InetAddress.getByName(servidor.host);
+                this.servidorPuerto = servidor.puerto;
+                
+                System.out.println("✓ Conectado al servidor: " + servidor.host + 
+                                 ":" + servidor.puerto);
+                return true;
+
+            } catch (IOException e) {
+                System.out.println("✗ Servidor no disponible: " + servidor.host + 
+                                 ":" + servidor.puerto);
+                
+                // Probar siguiente servidor
+                indiceServidorActual = (indiceServidorActual + 1) % 
+                                      servidoresDisponibles.size();
+                intentos++;
+
+                // Si volvimos al servidor inicial, esperar antes de reintentar
+                if (indiceServidorActual == servidorInicio) {
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException ie) {}
+                }
+            }
+        }
+
+        System.out.println("❌ No se pudo conectar a ningún servidor");
+        return false;
+    }
+
+    /**
+     * Reconecta automáticamente si se pierde la conexión
+     */
+    private boolean reconectar() {
+        System.out.println("\n⚠ Conexión perdida. Intentando reconectar...");
+        
+        // Cerrar socket antiguo
+        try {
+            if (socket != null) {
+                socket.close();
+            }
+        } catch (IOException e) {}
+
+        // Intentar conectar con otro servidor
+        int servidorOriginal = indiceServidorActual;
+        indiceServidorActual = (indiceServidorActual + 1) % 
+                              servidoresDisponibles.size();
+
+        for (int i = 0; i < MAX_REINTENTOS; i++) {
+            if (conectarConFailover()) {
+                System.out.println("✓ Reconexión exitosa!");
+                
+                // Reenviar última oferta si existe
+                if (miUltimaOferta > 0) {
+                    try {
+                        System.out.println("[INFO] Reenviando última oferta: $" + 
+                                         miUltimaOferta);
+                        socket.enviar(String.valueOf(miUltimaOferta));
+                    } catch (IOException e) {
+                        System.out.println("⚠ No se pudo reenviar oferta");
+                    }
+                }
+                
+                return true;
+            }
+
+            try {
+                Thread.sleep(TIMEOUT_RECONEXION);
+            } catch (InterruptedException e) {}
+        }
+
+        System.out.println("❌ No se pudo reconectar después de " + 
+                         MAX_REINTENTOS + " intentos");
+        return false;
     }
 
     /**
@@ -48,22 +177,44 @@ public class ClienteSubastaHelper {
         synchronized(lockConfirmacion) {
             ultimaConfirmacion = null;
 
-            // Enviar oferta
-            socket.enviar(String.valueOf(oferta));
-
-            // Esperar confirmación (timeout 10 seg)
             try {
-                lockConfirmacion.wait(10000);
-            } catch (InterruptedException e) {
-                return new InfoEstado(false, "Timeout esperando respuesta", "", 0.0, 0, false);
-            }
+                // Enviar oferta
+                socket.enviar(String.valueOf(oferta));
 
-            if (ultimaConfirmacion == null) {
-                return new InfoEstado(false, "Sin respuesta del servidor", "", 0.0, 0, false);
-            }
+                // Esperar confirmación (timeout 10 seg)
+                try {
+                    lockConfirmacion.wait(10000);
+                } catch (InterruptedException e) {
+                    return new InfoEstado(false, "Timeout esperando respuesta", 
+                                        "", 0.0, 0, false);
+                }
 
-            // Procesar confirmación
-            return procesarRespuesta(ultimaConfirmacion);
+                if (ultimaConfirmacion == null) {
+                    // Intentar reconectar
+                    if (reconectar()) {
+                        // Reenviar oferta
+                        socket.enviar(String.valueOf(oferta));
+                        try {
+                            lockConfirmacion.wait(10000);
+                        } catch (InterruptedException e) {}
+                    }
+
+                    if (ultimaConfirmacion == null) {
+                        return new InfoEstado(false, "Sin respuesta del servidor", 
+                                            "", 0.0, 0, false);
+                    }
+                }
+
+                // Procesar confirmación
+                return procesarRespuesta(ultimaConfirmacion);
+
+            } catch (IOException e) {
+                // Intentar reconectar
+                if (reconectar()) {
+                    return enviarOferta(oferta); // Reintentar
+                }
+                throw e;
+            }
         }
     }
 
@@ -73,7 +224,6 @@ public class ClienteSubastaHelper {
     public String esperarResultado() throws SocketException, IOException {
         System.out.println("\n⏳ Aguardando resultado final...");
 
-        // Esperar a que el hilo receptor termine
         try {
             if (hiloReceptor != null) {
                 hiloReceptor.join(30000);
@@ -82,12 +232,11 @@ public class ClienteSubastaHelper {
             System.out.println("Espera interrumpida: " + e.getMessage());
         }
 
-        // Si ya recibimos resultado, usarlo
-        if (ultimaSincronizacion != null && ultimaSincronizacion.startsWith("RESULTADO:")) {
+        if (ultimaSincronizacion != null && 
+            ultimaSincronizacion.startsWith("RESULTADO:")) {
             return formatearResultado(ultimaSincronizacion);
         }
 
-        // Si no, leer directamente
         String resultado = socket.recibir();
         return formatearResultado(resultado);
     }
@@ -101,14 +250,11 @@ public class ClienteSubastaHelper {
                 return new InfoEstado(false, respuesta, "", 0.0, 0, false);
             }
 
-            // Remover prefijo CONF: si existe
             if (respuesta.startsWith("CONF:")) {
                 respuesta = respuesta.substring(5);
             }
 
-            // Formato: OFERTA_MAX:ip:monto:TIEMPO:segundos:ESTADO:estado
             String[] partes = respuesta.split(":");
-
             String ipMax = partes[1];
             double montoMax = Double.parseDouble(partes[2]);
             long tiempoRestante = Long.parseLong(partes[4]);
@@ -128,7 +274,6 @@ public class ClienteSubastaHelper {
      */
     private String formatearResultado(String resultado) {
         try {
-            // Formato: "RESULTADO:IP:OFERTA:cantidad"
             String[] partes = resultado.split(":");
             if (partes.length >= 4) {
                 String ipGanador = partes[1];
@@ -139,7 +284,6 @@ public class ClienteSubastaHelper {
                 sb.append("  💰 Oferta ganadora: $").append(montoGanador).append("\n");
                 sb.append("  📊 Tu última oferta: $").append(miUltimaOferta).append("\n\n");
 
-                // Verificar si ganó
                 if (miUltimaOferta == montoGanador) {
                     sb.append("  ✨ ¡FELICITACIONES! ¡GANASTE LA SUBASTA! ✨");
                 } else {
@@ -188,10 +332,14 @@ public class ClienteSubastaHelper {
 
                     if (mensaje == null) {
                         System.out.println("\n[INFO] Servidor cerró la conexión");
+                        
+                        // Intentar reconectar
+                        if (subastaVigente && reconectar()) {
+                            continue;
+                        }
                         break;
                     }
 
-                    // Procesar diferentes tipos de mensajes
                     if (mensaje.startsWith("INICIO:")) {
                         procesarInicio(mensaje);
                     } else if (mensaje.startsWith("SYNC:")) {
@@ -209,8 +357,9 @@ public class ClienteSubastaHelper {
                     }
                 }
             } catch (IOException e) {
-                if (escuchando) {
-                    System.out.println("\nError en receptor: " + e.getMessage());
+                if (escuchando && subastaVigente) {
+                    System.out.println("\n⚠ Error de conexión");
+                    reconectar();
                 }
             }
         });
@@ -223,7 +372,6 @@ public class ClienteSubastaHelper {
      */
     private void procesarInicio(String mensaje) {
         try {
-            // Formato: INICIO:DURACION:segundos
             String[] partes = mensaje.split(":");
             if (partes.length >= 3) {
                 long duracion = Long.parseLong(partes[2]);
@@ -245,7 +393,6 @@ public class ClienteSubastaHelper {
      */
     private void procesarSincronizacion(String sync) {
         try {
-            // Formato: OFERTA_MAX:ip:monto:TIEMPO:segundos
             String[] partes = sync.split(":");
             if (partes.length >= 5) {
                 String ipLider = partes[1];

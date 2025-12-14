@@ -1,4 +1,6 @@
 javac -d . servidor/*.java cliente/*.java
+javac -d . servidor/*.java cliente/*.java
+
 
 server 1
 java -cp bin servidor.ServidorSubasta 5000
@@ -13,3 +15,19 @@ java -cp bin cliente.ClienteSubasta
 
 verificar ubicacion
 dir
+
+
+# Compilar
+javac -d . servidor/*.java cliente/*.java
+
+# Terminal 1: Servidor 1
+java servidor.ServidorSubasta 1
+
+# Terminal 2: Servidor 2
+java servidor.ServidorSubasta 2
+
+# Terminal 3: Servidor 3
+java servidor.ServidorSubasta 3
+
+# Terminal 4+: Clientes
+java cliente.ClienteSubasta
